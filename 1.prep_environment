@@ -1,0 +1,23 @@
+#first you want to set up your environment
+#1. make a file for your CetSet 
+#2. within that CetSet folder make a samples folder and a logs folder
+├── CetSet/
+│   ├── samples/             
+│   ├── logs/
+
+#3. place your samples into the samples folder
+
+#4. go into your samples folder
+#unzipping the fastq files
+gunzip_func(){
+for f in "$@"
+    do
+    gunzip "$f"
+    done
+}
+ export function
+export -f gunzip_func
+
+## run function in parallel
+module load Parallel/20210422 # load gnu-parallel
+parallel -j 100% --line-buffer gunzip_func ::: *.gz
