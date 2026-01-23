@@ -1,0 +1,23 @@
+#this part of the code will look in your data for the CetSet reads per loci, and separate them out per sample
+
+module load BBMap/39.01-GCC-11.3.0
+
+# grep after trimming the primers, this function separates reads by locus using grep
+
+echo -e "Cet_Set_0\nCet_Set_1\nCet_Set_2\nCet_Set_3" > loci_F.txt #this makes a list of the cs loci in a text file
+echo -e "Cet_Set_0\nCet_Set_1\nCet_Set_2\nCet_Set_3" > loci_R.txt
+
+assort_func() { #this code looks for specific patterns in a file then cleans up the output and saved it to a new file
+  f="$1" #f is the loci_F or R.txt
+  input_file="$2" #the input file if filtered_R1.fastq
+  grep -A3 "$f" "$input_file" | sed -e '/^--$/d' > "$f.$input_file" #then it will save to a loci_F.reads.fastq
+}
+export -f assort_func
+
+## change
+parallel -j 100% assort_func :::: <(cat loci_F.txt) ::: *_R1_filtered.fastq #this makes everything run parallel following the code at the end
+parallel -j 100% assort_func :::: <(cat loci_R.txt) ::: *_R2_filtered.fastq
+
+# Delete empty files
+
+find . -type f -empty -delete
