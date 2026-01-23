@@ -1,0 +1,28 @@
+#now checking the distribution of primer hits and cleaning up the fastq files
+
+module load Parallel/20210422 # load gnu-parallel
+# use awk to get distribution of primer hits before equalising files
+
+for f in Cet_Set_*_filtered.fastq; do #this is a loop for all files that start with cet_set and end in .fastq
+    echo "Occurrences in file: $f" >> pre_repair.primer_occurrences.txt #this makes a header line in the txt file
+    # Extract the third column from lines starting with '@'
+    awk 'NR % 4 == 1 {print $3}' "$f" | #and extracts primer names from fastq headers
+    # Count the occurrences of each term e.g. each primer occurrence
+    sort | uniq -c >> pre_repair.primer_occurrences.txt #then logs the occurrences in the txt file
+done
+#then you should view the text file to see the occurrences in each file which is number of reads
+cat pre_repair.primer_occurrences.txt
+
+
+# Function to remove the third field from lines starting with @ in parallel
+remove_third_field() {
+    f="$1"
+    awk 'NR % 4 == 1 {$3=""; print; next} {print}' "$f" \
+        > "$(basename "$f" _filtered.fastq).clean"
+}
+
+# Export the function for use with parallel
+export -f remove_third_field
+
+# Run remove_third_field in parallel for each file
+parallel -j 100% --line-buffer remove_third_field ::: Cet_Set_*_filtered.fastq
