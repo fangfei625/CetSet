@@ -1,0 +1,11 @@
+#in bash
+
+ml load BLAST/2.16.0-GCC-12.3.0
+
+blastn -task blastn -query ./CS_0_ASVs.fasta -db /nesi/nobackup/uoa02626/William/cetset_DB/reference_database_creator/set3_cetacea_BLAST_TAX -evalue 1e-10 -num_threads 2 -out ./CS_0_ASVs_class_edna.blast -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen" -max_target_seqs 50
+
+blastn -task blastn -query ./CS_1_ASVs.fasta -db /nesi/nobackup/uoa02626/William/cetset_DB/reference_database_creator/set3_cetacea_BLAST_TAX -evalue 1e-10 -num_threads 2 -out ./CS_1_ASVs_class_edna.blast -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen" -max_target_seqs 50
+
+blastn -task blastn -query ./CS_2_ASVs.fasta -db /nesi/nobackup/uoa02626/William/cetset_DB/reference_database_creator/set3_cetacea_BLAST_TAX -evalue 1e-10 -num_threads 2 -out ./CS_2_ASVs_class_edna.blast -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen" -max_target_seqs 50
+
+blastn -task blastn -query ./CS_3_ASVs.fasta -db /nesi/nobackup/uoa02626/William/cetset_DB/reference_database_creator/set3_cetacea_BLAST_TAX -evalue 1e-10 -num_threads 2 -out ./CS_3_ASVs_class_edna.blast -outfmt "6 qseqid sseqid pident length mismatch gapopen qstart qend sstart send evalue bitscore qlen" -max_target_seqs 50
