@@ -1,0 +1,35 @@
+#repairing files and matching reads
+
+module load Parallel/20210422 # load gnu-parallel
+module load BBMap/39.01-GCC-11.3.0
+
+## check to see how many read pairs match between clean forward and reverse fastq files
+for f in Cet_Set_*.clean #this will loop over all clean files
+do
+    r="${f/_R1.clean/_R2.clean}" #then finds the reverse file
+    echo "Pairs matching in file: $f" >> pair_match.txt #says which file is being processed
+    awk '/^@/ && (NR%4 == 1) {print $1}' "$f" | sort > temp1.txt #extracts the read ids from the heads
+    awk '/^@/ && (NR%4 == 1) {print $1}' "$r" | sort > temp2.txt
+    comm -12 temp1.txt temp2.txt | wc -l >> pair_match.txt 
+    rm temp1.txt temp2.txt #deletes temporary files
+done
+cat pair_match.txt #to see the number of matching read ids
+
+# Function to repair paired-end reads using repair.sh
+repair_func() { #this loop function will actually match the reads
+  for f in $@
+  do
+    r="${f/_R1.clean/_R2.clean}"
+    out_fwd="${f}_repair.fastq"
+    out_rev="${r}_repair.fastq"
+
+    # Run repair.sh using the modified files
+    repair.sh in1="${f}" in2="${r}" out1="$out_fwd" out2="$out_rev"
+          done
+}
+
+# Export the function for use with parallel
+export -f repair_func
+
+# Run repair_func in parallel for each forward read file
+parallel -j 100% --line-buffer repair_func ::: *_R1.clean
