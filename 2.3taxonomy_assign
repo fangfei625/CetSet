@@ -1,0 +1,62 @@
+#in R
+
+library(tidyverse)
+library(ggnewscale)
+
+#1. function for blasting dataframe ----------------------------------------------------
+#this takes your blast file and then the database
+generate_ani_data <- function(blast_file, database) {
+  
+  blast_file <- read_delim(blast_file)
+  database   <- read_delim(database)
+  
+  colnames(blast_file) <- c("Query","Subject","PercentID","alignment_length",
+                            "mismatches","gap_openings","query_start","query_end",
+                            "subject_start","subject_end","Evalue","bitscore","qlen")
+  
+  blast_file$Accession <- sub("^[^|]*\\|", "", blast_file$Subject)
+  blast_file$Accession <- gsub("[|]", "", blast_file$Accession)
+  
+  # Your database has 10 columns — do NOT delete column 11
+  colnames(database) <- c("Accession","Species_FromName","Number","Domain","Phylum",
+                          "Class","Order","Family","Genus","Species", "Sequence")
+  
+  database <- as.data.frame(database)
+  database <- dplyr::distinct(database, Accession, .keep_all = TRUE)
+  
+  merged_acc_blastdf <- dplyr::left_join(blast_file, database, by = "Accession")
+  return(merged_acc_blastdf)
+}
+
+# 2. assigning vectors for loop -------------------------------------------
+
+#assigning vectors for our blast files
+blast_file <- c("./CS_0_ASVs_class_ag1515.blast",
+                "./CS_1_ASVs_class_ag1515.blast",
+                "./CS_2_ASVs_class_ag1515.blast",
+                "./CS_3_ASVs_class_ag1515.blast"
+)
+
+#assigning vectors for our databases
+database <- c("./Set0_DB_preblast.txt",
+              "./Set1_DB_preblast.txt",
+              "./Set2_DB_preblast.txt",
+              "./Set3_DB_preblast.txt")
+
+
+# 3. for loop to analyse blast files against database ---------------------
+
+results <- list()
+
+for (i in seq_along(blast_file)) {
+  results[[i]] <- generate_ani_data(blast_file[i], database[i])
+}
+
+results[[1]]
+
+# 4. saving results files  -----------------------------------------------
+library(writexl)
+
+for (i in seq_along(results)) {
+  write_xlsx(results[[i]], paste0("AG1515_results_set", i, ".xlsx"))
+}
