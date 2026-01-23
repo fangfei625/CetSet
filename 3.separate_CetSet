@@ -1,5 +1,6 @@
 #this part of the code will look in your data for the CetSet reads per loci, and separate them out per sample
 
+module load Parallel/20210422 # load gnu-parallel
 module load BBMap/39.01-GCC-11.3.0
 
 # grep after trimming the primers, this function separates reads by locus using grep
