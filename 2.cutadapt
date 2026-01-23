@@ -1,0 +1,59 @@
+#once your files are unzipped you can use cutadapt to find the cetset primers in your data
+
+module load cutadapt/4.4-gimkl-2022a-Python-3.11.3 # load a sequence trimming software
+module load BBMap/39.01-GCC-11.3.0
+
+  #find cetset loci
+primerfind_func() { #this is a loop function
+  for input_file in "$@"; do
+  # Extract sample ID 
+ sample_id=$(echo "$input_file" | cut -d'_' -f1-2)
+forward_file="$input_file"
+reverse_file="${input_file/_R1/_R2}"
+output_forward="${sample_id}_R1_filtered.fastq"
+output_reverse="${sample_id}_R2_filtered.fastq"
+
+  # Run cutadapt on forward reads
+  cutadapt \
+  -g Cet_Set_0=AGYATRATNTTYCGNCCYYTYAGYCA \
+  -g Cet_Set_1=CTNHTRAADTGAAGAGTCYTYGTAGT \
+  -g Cet_Set_2=CRCCRYCARCMCCCAAAG \
+  -g Cet_Set_3=YAYRYTATGTATWAYNGTRCATTC \
+  -y '{name}' \
+  --minimum-length=50 \
+  --no-indels \
+  "$forward_file" \
+  -o "$output_forward"
+  
+  # Run cutadapt on reverse reads
+  cutadapt \
+  -g Cet_Set_0=CTCCRYTTTYCGGTTTACAAGGCC \
+  -g Cet_Set_0=CTCCDTYTYYGRYTTACAARRYC \
+  -g Cet_Set_1=GGARTAGTTTAWRNARAAYYYCAG \
+  -g Cet_Set_1=GGAATAGTTTAATRTAGAATTTCAG \
+  -g Cet_Set_2=TACGGGCTTTAACTTCCGTA \
+  -g Cet_Set_2=TACGRGCTTYMACWNNYCGTR \
+  -g Cet_Set_2=TACGGACTTTAACATAGKCGTA \
+  -g Cet_Set_2=TACGGACTWYMARYYYMACCGTA \
+  -g Cet_Set_3=GCYRAGCGGGWTRCTGGT \
+  -y '{name}' \
+  --minimum-length=50 \
+  --no-indels \
+  "$reverse_file" \
+  -o "$output_reverse"
+  
+
+  echo "Processing sample: $input_file"
+  echo "Forward file: $forward_file"
+  echo "Reverse file: $reverse_file"
+  echo "Output forward: $output_forward"
+  echo "Output reverse: $output_reverse"
+  echo "Finished processing $input_file"
+  done
+}
+
+# export function
+export -f primerfind_func #this is to export the function so it can run shell commands in parallel, using the parallel function
+
+## Richard to change; needs to index CPUs
+parallel -j 100% --line-buffer primerfind_func ::: *_R1.fastq #this will do everything simultaneously 
