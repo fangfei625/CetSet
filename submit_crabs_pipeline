@@ -1,0 +1,6 @@
+#!/bin/bash
+set -euo pipefail
+PCR_JOBID=$(sbatch --parsable submit_crabs_pcr_array.sh)
+echo "Submitted PCR array as job ${PCR_JOBID}"
+SET_JOBID=$(sbatch --parsable --dependency=afterok:${PCR_JOBID} submit_crabs_set_array.sh)
+echo "Submitted Set array as job ${SET_JOBID}, will start once job ${PCR_JOBID} completes successfully"
