@@ -1,0 +1,65 @@
+#!/usr/bin/env bash
+#
+# filter_by_taxid.sh
+#
+# Removes rows from the Set*_DB_derep_filt.txt files whose taxid (3rd
+# tab-delimited column) is not present in ncbitaxonomy_cetacea_ft.csv
+# (tax_id is the 2nd comma-delimited column).
+#
+# Usage:
+#   ./filter_by_taxid.sh /path/to/ncbitaxonomy_cetacea_ft.csv Set0_DB_derep_filt.txt [Set1... SetN...]
+#
+# Filtered output is written next to each input file as <name>.filtered.txt
+# (originals are left untouched). Dropped rows are logged to
+# <name>.dropped.txt for review.
+
+set -euo pipefail
+
+if [ "$#" -lt 2 ]; then
+    echo "Usage: $0 <ncbitaxonomy_csv> <db_file1> [db_file2 ...]" >&2
+    exit 1
+fi
+
+TAXONOMY_CSV="$1"
+shift
+
+if [ ! -f "$TAXONOMY_CSV" ]; then
+    echo "Taxonomy file not found: $TAXONOMY_CSV" >&2
+    exit 1
+fi
+
+# Build the set of valid tax_ids once (column 2, skip header, comma-delimited).
+VALID_TAXIDS=$(mktemp)
+trap 'rm -f "$VALID_TAXIDS"' EXIT
+
+awk -F',' 'NR>1 && $2!="" {print $2}' "$TAXONOMY_CSV" | sort -u > "$VALID_TAXIDS"
+echo "Loaded $(wc -l < "$VALID_TAXIDS") valid tax_ids from $TAXONOMY_CSV"
+
+for DB in "$@"; do
+    if [ ! -f "$DB" ]; then
+        echo "Skipping missing file: $DB" >&2
+        continue
+    fi
+
+    BASE="${DB%.txt}"
+    KEEP="${BASE}.filtered.txt"
+    DROP="${BASE}.dropped.txt"
+
+    awk -F'\t' -v OFS='\t' -v dropfile="$DROP" '
+        BEGIN {
+            while ((getline id < ARGV[1]) > 0) valid[id] = 1
+            close(ARGV[1])
+            ARGV[1] = ""   # prevent awk from trying to read it as a data file
+        }
+        {
+            if ($3 in valid) print > "'"$KEEP"'"
+            else print > dropfile
+        }
+    ' "$VALID_TAXIDS" "$DB"
+
+    TOTAL=$(wc -l < "$DB")
+    KEPT=$([ -f "$KEEP" ] && wc -l < "$KEEP" || echo 0)
+    DROPPED=$([ -f "$DROP" ] && wc -l < "$DROP" || echo 0)
+
+    echo "$DB: total=$TOTAL kept=$KEPT dropped=$DROPPED -> $KEEP"
+done
