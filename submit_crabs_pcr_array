@@ -1,0 +1,22 @@
+#!/bin/bash
+#SBATCH --array=1-85
+#SBATCH --job-name=crabs_pcr
+#SBATCH --output=logs/crabs_pcr_%A_%a.out
+#SBATCH --error=logs/crabs_pcr_%A_%a.err
+#SBATCH --time=02:00:00
+#SBATCH --mem=50G
+#SBATCH --account=xxx
+#SBATCH --cpus-per-task=1
+
+mkdir -p logs
+
+ml load VSEARCH
+ml load cutadapt
+ml load FastTree
+ml load ClustalW2
+ml load BLAST
+
+COMMAND=$(sed -n "${SLURM_ARRAY_TASK_ID}p" crabs_pcr_commands.txt)
+echo "Running PCR array task ${SLURM_ARRAY_TASK_ID} of 85"
+echo "Command: ${COMMAND}"
+eval ${COMMAND}
