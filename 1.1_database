@@ -1,0 +1,235 @@
+#!/bin/bash
+# ============================================================================
+# CetSet reference database — full pipeline
+# Source data -> merged/filtered db_cet.txt -> per-primer-pair CRABS runs
+# Requires: crabs (https://github.com/gjeunen/reference_database_creator), awk
+# ============================================================================
+set -euo pipefail
+
+# ---- User-editable settings ------------------------------------------------
+PRIMER_CSV="cetset_primers.csv"                            # #,Name,Primer,SetID,Direction
+INPUT_CRABS_DB="Input_CRABS_db"                             # dir with already-CRABS-formatted source files
+
+mkdir -p insilico_db derepl_db filtered_db aligned_db postfilter_db logs
+# NOTE: postfilter_db was missing from this mkdir before (POSTFILTERED/FINAL
+# wrote into ./postfilter_db/ and ./final_db/ that never existed) -- added
+# here since --filter would otherwise fail writing its output. final_db is
+# no longer needed: per-Set final output now lands directly at
+# ./SetN_DB_derep_filt.txt (see SECTION 2 below).
+
+# ============================================================================
+# SECTION 1 — Build the source database (db_cet.txt)
+# ============================================================================
+# Sources are already downloaded and imported into CRABS format under
+# $INPUT_CRABS_DB (crabs_ncbi.txt, crabs_bold.txt, crabs_embl_1.txt..crabs_embl_9.txt,
+# seqdbcust.txt for custom additions), so we skip --download-*/--import and go
+# straight to merge -> dereplicate -> filter.
+
+echo "=== 1.1 Merge all CRABS-formatted sources ==="
+EMBL_FILES=$(ls "${INPUT_CRABS_DB}"/crabs_embl_*.txt | tr '\n' ';')
+MERGE_INPUT="${INPUT_CRABS_DB}/crabs_ncbi.txt;${INPUT_CRABS_DB}/crabs_bold.txt;${EMBL_FILES};${INPUT_CRABS_DB}/seqdbcust.txt"
+./crabs --merge --input "${MERGE_INPUT}" --uniq --output merged.txt
+
+echo "=== 1.2 Dereplicate + filter merged database -> db_cet.txt ==="
+./crabs --dereplicate --input merged.txt --output merged_dereplicated.txt \
+  --dereplication-method 'unique_species'
+
+./crabs --filter --input merged_dereplicated.txt --output db_cet.txt \
+  --minimum-length 80 --maximum-length 25000 --maximum-n 1 \
+  --environmental --no-species-id --rank-na 2
+
+echo "=== Source database complete: db_cet.txt ==="
+
+# ============================================================================
+# SECTION 2 — Per-pair PCR, then per-Set merge -> dereplicate -> filter ->
+#              align -> postfilter -> final-dereplicate (Set0-Set3)
+# ============================================================================
+# Primers within a Set are minor/degenerate variants of each other (not
+# independent assays), so rather than running the full pipeline separately
+# per Forward x Reverse pair and merging at the end, everything except the
+# PCR step itself now runs ONCE per Set on the pooled amplicons from every
+# pair in that Set:
+#   per pair:  in-silico PCR
+#   per Set:   merge (all its pairs' PCR hits) -> dereplicate -> filter ->
+#              pairwise-global-alignment -> filter (postfilter) ->
+#              dereplicate (final)
+# --pairwise-global-alignment still needs exactly one --forward/--reverse
+# pair, so each Set uses ITS FIRST pair's primers as a representative --
+# fine given they're near-identical variants targeting the same site.
+#
+# This produces two independent command lists (crabs_pcr_commands.txt,
+# crabs_set_commands.txt) instead of one, because every per-Set command
+# depends on ALL of that Set's per-pair PCR commands having finished --
+# see SECTION 3 for how these get submitted.
+
+echo "=== 2.1 Build primer combinations from ${PRIMER_CSV} ==="
+> crabs_pcr_commands.txt
+> crabs_set_commands.txt
+
+declare -A SET_PAIR_IDS
+declare -A SET_FIRST_FWD
+declare -A SET_FIRST_REV
+
+# Note: strips trailing \r so this works whether cetset_primers.csv has
+# Unix or Windows (CRLF) line endings.
+PAIR_NUM=0
+for SET in $(tail -n +2 "${PRIMER_CSV}" | awk -F, '{gsub(/\r$/,"")} $4!="" {print $4}' | sort -u); do
+
+  mapfile -t FWD_SEQS < <(awk -F, -v s="$SET" '{gsub(/\r$/,"")} NR>1 && $4==s && $5=="Forward" {print $3}' "${PRIMER_CSV}")
+  mapfile -t REV_SEQS < <(awk -F, -v s="$SET" '{gsub(/\r$/,"")} NR>1 && $4==s && $5=="Reverse" {print $3}' "${PRIMER_CSV}")
+
+  SET_PAIR_IDS[$SET]=""
+
+  for F in "${FWD_SEQS[@]}"; do
+    for R in "${REV_SEQS[@]}"; do
+      PAIR_NUM=$((PAIR_NUM + 1))
+      PAIRID=$(printf "%s_pair%03d" "${SET}" "${PAIR_NUM}")
+      SET_PAIR_IDS[$SET]+="${PAIRID} "
+
+      if [[ -z "${SET_FIRST_FWD[$SET]:-}" ]]; then
+        SET_FIRST_FWD[$SET]="$F"
+        SET_FIRST_REV[$SET]="$R"
+      fi
+
+      INSILICO="./insilico_db/insilico_${PAIRID}.txt"
+      PCR_CMD="./crabs --in-silico-pcr --input db_cet.txt --output ${INSILICO} --forward ${F} --reverse ${R}"
+      echo "${PCR_CMD}" >> crabs_pcr_commands.txt
+    done
+  done
+done
+
+N_PCR_JOBS=$(wc -l < crabs_pcr_commands.txt)
+echo "=== Generated ${N_PCR_JOBS} per-pair PCR commands -> crabs_pcr_commands.txt ==="
+
+echo "=== 2.2 Build per-Set merge -> dereplicate -> filter -> align -> postfilter -> final-dereplicate commands ==="
+for SET in "${!SET_PAIR_IDS[@]}"; do
+  PAIR_FILES=""
+  for PAIRID in ${SET_PAIR_IDS[$SET]}; do
+    PAIR_FILES+="./insilico_db/insilico_${PAIRID}.txt;"
+  done
+  PAIR_FILES="${PAIR_FILES%;}"
+
+  MERGED="./insilico_db/insilico_${SET}_merged.txt"
+  DEREPL="./derepl_db/dereplicated_${SET}.txt"
+  FILTERED="./filtered_db/filtered_${SET}.txt"
+  ALIGNED="./aligned_db/aligned_${SET}.txt"
+  POSTFILTERED="./postfilter_db/postfilter_${SET}.txt"
+  FINAL="./${SET}_DB_derep_filt.txt"
+
+  F="${SET_FIRST_FWD[$SET]}"
+  R="${SET_FIRST_REV[$SET]}"
+
+  # PAIR_FILES is semicolon-joined ("a.txt;b.txt;..."); it MUST be quoted
+  # here, because this whole line later gets run via `eval` inside the
+  # array job (COMMAND=$(sed -n ...); eval ${COMMAND}) -- eval re-parses
+  # the reconstructed string as shell syntax, and an unquoted ";" is a
+  # command separator, not a literal character. Unquoted, bash would split
+  # "--input a.txt;b.txt;c.txt --uniq --output X.txt" into THREE commands
+  # ("--input a.txt", "b.txt", "c.txt --uniq --output X.txt") and try to
+  # *execute* b.txt as a program.
+  MERGE_CMD="./crabs --merge --input \"${PAIR_FILES}\" --uniq --output ${MERGED}"
+  DEREP_CMD="./crabs --dereplicate --input ${MERGED} --output ${DEREPL} --dereplication-method 'unique_species'"
+  FILTER_CMD="./crabs --filter --input ${DEREPL} --output ${FILTERED} --minimum-length 50 --maximum-length 800"
+  ALIGN_CMD="./crabs --pairwise-global-alignment --input db_cet.txt --amplicons ${FILTERED} --output ${ALIGNED} --forward ${F} --reverse ${R} --percent-identity 0.9 --coverage 85"
+  POSTFILTER_CMD="./crabs --filter --input ${ALIGNED} --output ${POSTFILTERED} --minimum-length 50 --maximum-length 800 --maximum-n 20 --environmental"
+  FINAL_DEREP_CMD="./crabs --dereplicate --input ${POSTFILTERED} --output ${FINAL} --dereplication-method 'unique_species'"
+
+  echo "${MERGE_CMD} && ${DEREP_CMD} && ${FILTER_CMD} && ${ALIGN_CMD} && ${POSTFILTER_CMD} && ${FINAL_DEREP_CMD}" >> crabs_set_commands.txt
+done
+
+N_SET_JOBS=$(wc -l < crabs_set_commands.txt)
+echo "=== Generated ${N_SET_JOBS} per-Set commands -> crabs_set_commands.txt ==="
+
+# ============================================================================
+# SECTION 3 — Run PCR jobs, then the per-Set jobs that depend on them
+# ============================================================================
+# Every per-Set command needs ALL of that Set's per-pair PCR commands to have
+# finished first (it merges their outputs), so this is now two arrays with a
+# dependency between them, not one flat fully-parallel array like before.
+
+# Option A: run serially (fine for local testing)
+# while IFS= read -r CMD; do eval "${CMD}"; done < crabs_pcr_commands.txt
+# while IFS= read -r CMD; do eval "${CMD}"; done < crabs_set_commands.txt
+
+# Option B (recommended): submit as two dependent SLURM array jobs
+cat > submit_crabs_pcr_array.sh <<EOF
+#!/bin/bash
+#SBATCH --array=1-${N_PCR_JOBS}
+#SBATCH --job-name=crabs_pcr
+#SBATCH --output=logs/crabs_pcr_%A_%a.out
+#SBATCH --error=logs/crabs_pcr_%A_%a.err
+#SBATCH --time=02:00:00
+#SBATCH --mem=50G
+#SBATCH --account=uoa02626
+#SBATCH --cpus-per-task=1
+
+mkdir -p logs
+
+ml load VSEARCH
+ml load cutadapt
+ml load FastTree
+ml load ClustalW2
+ml load BLAST
+#module load Python/3.11.6-foss-2023a
+export PATH="/nesi/nobackup/uoa04039/CRABS_Nina/reference_database_creator:$PATH"
+
+COMMAND=\$(sed -n "\${SLURM_ARRAY_TASK_ID}p" crabs_pcr_commands.txt)
+echo "Running PCR array task \${SLURM_ARRAY_TASK_ID} of ${N_PCR_JOBS}"
+echo "Command: \${COMMAND}"
+eval \${COMMAND}
+EOF
+chmod +x submit_crabs_pcr_array.sh
+
+# NOTE on sizing: this per-Set job now does the merge/dereplicate/filter/
+# align/postfilter/final-dereplicate work that used to be spread across
+# ~N_PCR_JOBS/4 separate per-pair jobs -- align in particular was the
+# heaviest single step before, and now runs once per Set on the pooled
+# amplicons from every pair in it rather than once per pair. time/mem below
+# are a starting guess, NOT a measured figure for your actual per-Set row
+# counts -- check ./logs/ after your first run and adjust.
+cat > submit_crabs_set_array.sh <<EOF
+#!/bin/bash
+#SBATCH --array=1-${N_SET_JOBS}
+#SBATCH --job-name=crabs_set
+#SBATCH --output=logs/crabs_set_%A_%a.out
+#SBATCH --error=logs/crabs_set_%A_%a.err
+#SBATCH --time=12:00:00
+#SBATCH --mem=100G
+#SBATCH --account=uoa02626
+#SBATCH --cpus-per-task=1
+
+mkdir -p logs
+
+ml load VSEARCH
+ml load cutadapt
+ml load FastTree
+ml load ClustalW2
+ml load BLAST
+#module load Python/3.11.6-foss-2023a
+export PATH="/nesi/nobackup/uoa04039/CRABS_Nina/reference_database_creator:$PATH"
+
+COMMAND=\$(sed -n "\${SLURM_ARRAY_TASK_ID}p" crabs_set_commands.txt)
+echo "Running Set array task \${SLURM_ARRAY_TASK_ID} of ${N_SET_JOBS}"
+echo "Command: \${COMMAND}"
+eval \${COMMAND}
+EOF
+chmod +x submit_crabs_set_array.sh
+
+# Convenience wrapper: submits the PCR array, then chains the Set array
+# after it with --dependency=afterok so it only starts once every pair's
+# PCR output for that Set actually exists.
+cat > submit_crabs_pipeline.sh <<'EOF'
+#!/bin/bash
+set -euo pipefail
+PCR_JOBID=$(sbatch --parsable submit_crabs_pcr_array.sh)
+echo "Submitted PCR array as job ${PCR_JOBID}"
+SET_JOBID=$(sbatch --parsable --dependency=afterok:${PCR_JOBID} submit_crabs_set_array.sh)
+echo "Submitted Set array as job ${SET_JOBID}, will start once job ${PCR_JOBID} completes successfully"
+EOF
+chmod +x submit_crabs_pipeline.sh
+
+echo "=== Done. Submit the two-stage pipeline with: ./submit_crabs_pipeline.sh ==="
+echo "    (or manually: sbatch submit_crabs_pcr_array.sh, then"
+echo "     sbatch --dependency=afterok:<jobid> submit_crabs_set_array.sh)"
+echo "    Per-Set final references land at ./Set0_DB_derep_filt.txt .. ./Set3_DB_derep_filt.txt"
+echo "    -- ready for reference_prep_per_set.sh / loo_split.py directly, no further merging needed."
