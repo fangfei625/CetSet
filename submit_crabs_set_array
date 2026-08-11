@@ -1,0 +1,24 @@
+#!/bin/bash
+#SBATCH --array=1-4
+#SBATCH --job-name=crabs_set
+#SBATCH --output=logs/crabs_set_%A_%a.out
+#SBATCH --error=logs/crabs_set_%A_%a.err
+#SBATCH --time=12:00:00
+#SBATCH --mem=100G
+#SBATCH --account=xxxx
+#SBATCH --cpus-per-task=1
+
+mkdir -p logs
+
+ml load VSEARCH
+ml load cutadapt
+ml load FastTree
+ml load ClustalW2
+ml load BLAST
+#module load Python/3.11.6-foss-2023a
+
+
+COMMAND=$(sed -n "${SLURM_ARRAY_TASK_ID}p" crabs_set_commands.txt)
+echo "Running Set array task ${SLURM_ARRAY_TASK_ID} of 4"
+echo "Command: ${COMMAND}"
+eval ${COMMAND}
