@@ -1,0 +1,138 @@
+#!/usr/bin/env bash
+#
+# run_crabs_pipeline_taxid_filtered.sh
+#
+# Same CRABS pipeline as before (merge -> dereplicate -> filter -> PGA ->
+# filter -> dereplicate), for Set0-Set3, but with a taxid filter (against
+# ncbitaxonomy_cetacea_ft.csv) inserted at two points so the PGA step never
+# has to align huge numbers of off-target sequences:
+#
+#   1. Right after --merge on the in silico PCR output, before dereplicate/
+#      filter/PGA - drops off-target amplicons as early as possible.
+#   2. Once on db_cet.txt (the PGA reference database), reused by all four
+#      sets - shrinks the alignment target from "everything in db_cet.txt"
+#      down to cetacean-only references.
+#
+# ASSUMPTION: taxid is tab-delimited column 3 in every CRABS-format file
+# here (insilico_*_pairNNN.txt, db_cet.txt), same as in your final
+# Set*_DB_derep_filt.txt outputs, since CRABS carries that column through
+# merge/dereplicate/filter/PGA unchanged. This was NOT verified against your
+# actual db_cet.txt or insilico_db/ files (not available in this session) -
+# before running the full pipeline, sanity check with e.g.:
+#   head -1 db_cet.txt | awk -F'\t' '{print $3}'
+#   head -1 insilico_db/insilico_Set0_pair001.txt | awk -F'\t' '{print $3}'
+# Both should print a bare NCBI taxid. If not, adjust TAXID_COL below.
+#
+# NOT executed/tested here - no crabs binary or your pipeline files in this
+# session.
+#
+# Usage: run from the directory containing db_cet.txt, insilico_db/, crabs,
+# and ncbitaxonomy_cetacea_ft.csv:
+#   ./run_crabs_pipeline_taxid_filtered.sh
+
+set -euo pipefail
+
+ml load VSEARCH
+ml load cutadapt
+ml load FastTree
+ml load ClustalW2
+ml load BLAST
+
+TAXONOMY_CSV="ncbitaxonomy_cetacea_ft.csv"
+REF_DB="db_cet.txt"
+REF_DB_FILTERED="db_cet.taxidfilt.txt"
+TAXID_COL=3   # tab-delimited column holding the taxid
+
+for req in "$TAXONOMY_CSV" "$REF_DB" ./crabs; do
+    if [ ! -e "$req" ]; then
+        echo "Required file/binary not found: $req" >&2
+        exit 1
+    fi
+done
+
+mkdir -p insilico_db derepl_db filtered_db aligned_db postfilter_db
+
+# ---- build the valid-taxid lookup once --------------------------------
+VALID_TAXIDS=$(mktemp)
+trap 'rm -f "$VALID_TAXIDS"' EXIT
+awk -F',' 'NR>1 && $2!="" {print $2}' "$TAXONOMY_CSV" | sort -u > "$VALID_TAXIDS"
+N_VALID=$(wc -l < "$VALID_TAXIDS")
+echo "Loaded $N_VALID valid tax_ids from $TAXONOMY_CSV"
+if [ "$N_VALID" -eq 0 ]; then
+    echo "No valid taxids loaded - check $TAXONOMY_CSV format." >&2
+    exit 1
+fi
+
+# ---- reusable taxid filter: keep rows whose taxid column is in the CSV -
+filter_by_taxid () {
+    local in="$1" out="$2"
+    awk -F'\t' -v OFS='\t' -v col="$TAXID_COL" -v valid_file="$VALID_TAXIDS" '
+        BEGIN { while ((getline id < valid_file) > 0) valid[id] = 1; close(valid_file) }
+        $col in valid { print }
+    ' "$in" > "$out"
+    local total kept
+    total=$(wc -l < "$in")
+    kept=$(wc -l < "$out")
+    echo "  $(basename "$in"): total=$total kept=$kept dropped=$((total - kept)) -> $(basename "$out")"
+    if [ "$kept" -eq 0 ]; then
+        echo "  WARNING: 0 rows kept - check TAXID_COL / file format before trusting downstream results." >&2
+    fi
+}
+
+# ---- filter the PGA reference database once (shared by every set) -----
+echo "Filtering PGA reference database:"
+filter_by_taxid "$REF_DB" "$REF_DB_FILTERED"
+
+# ---- build a semicolon-joined pair file list, zero-padded to 3 digits -
+pair_list () {
+    local prefix="$1" start="$2" end="$3"
+    local list=""
+    for i in $(seq -f "%03g" "$start" "$end"); do
+        list+="./insilico_db/insilico_${prefix}_pair${i}.txt;"
+    done
+    printf '%s' "${list%;}"
+}
+
+run_set () {
+    local set_id="$1" pairs="$2" fwd="$3" rev="$4"
+    echo "=== $set_id ==="
+
+    ./crabs --merge --input "$pairs" --uniq \
+            --output "./insilico_db/insilico_${set_id}_merged.txt"
+
+    filter_by_taxid "./insilico_db/insilico_${set_id}_merged.txt" \
+                     "./insilico_db/insilico_${set_id}_merged.taxidfilt.txt"
+
+    ./crabs --dereplicate \
+            --input "./insilico_db/insilico_${set_id}_merged.taxidfilt.txt" \
+            --output "./derepl_db/dereplicated_${set_id}.txt" \
+            --dereplication-method 'unique_species'
+
+    ./crabs --filter \
+            --input "./derepl_db/dereplicated_${set_id}.txt" \
+            --output "./filtered_db/filtered_${set_id}.txt" \
+            --minimum-length 50 --maximum-length 300
+
+    ./crabs --pairwise-global-alignment \
+            --input "$REF_DB_FILTERED" \
+            --amplicons "./filtered_db/filtered_${set_id}.txt" \
+            --output "./aligned_db/aligned_${set_id}.txt" \
+            --forward "$fwd" --reverse "$rev" --percent-identity 0.6 --coverage 10
+
+    ./crabs --filter \
+            --input "./aligned_db/aligned_${set_id}.txt" \
+            --output "./postfilter_db/postfilter_${set_id}.txt" \
+            --minimum-length 50 --maximum-length 300 --maximum-n 20 --environmental
+
+    ./crabs --dereplicate \
+            --input "./postfilter_db/postfilter_${set_id}.txt" \
+            --output "./${set_id}_DB_derep_filt.txt" \
+            --dereplication-method 'unique_species'
+}
+
+run_set "Set0" "$(pair_list Set0 1 20)"  "AGTATNATATTNCGACCCNTNAGCCA" "CTCCTTTTNCGGTTTACAAGACC"
+run_set "Set1" "$(pair_list Set1 21 40)" "CTTATAAANTGAAGAGTCTTTGTAGT" "GGAATAGTTTANGNAGAATTTCAG"
+run_set "Set2" "$(pair_list Set2 41 80)" "CNCCGCCANCACCCAAAG" "TACGNGCTTTAACTNACCGTA"
+run_set "Set3" "$(pair_list Set3 81 85)" "CANGCTATGTATAATNGTGCATTC" "GCNAAGCGGGTTGCTGGT"
+
+echo "Done."
