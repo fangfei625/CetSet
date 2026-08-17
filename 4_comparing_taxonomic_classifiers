@@ -1,0 +1,456 @@
+#setwd("./LOO_Validation/loo_run/")
+suppressMessages({
+  library(dada2)
+  library(BayesANT)
+  library(Biostrings)
+  library(readr)
+})
+
+sets <- c("Set0", "Set1", "Set2", "Set3")
+
+# Must match the --ranks order used when the source sequences were imported
+# into CRABS (see run_cetset_pipeline.sh: 'superkingdom;phylum;class;order;family;genus;species').
+rank_names <- c("Superkingdom", "Phylum", "Class", "Order", "Family", "Genus", "Species")
+
+n_threads <- 4
+
+dir.create("dada2_results", showWarnings = FALSE)
+dir.create("bayesant_results", showWarnings = FALSE)
+
+for (set in sets) {
+  
+  asv_matches <- Sys.glob(file.path(".", paste0(set, "_*.fasta")))
+  if (length(asv_matches) == 0) {
+    message("No ASV file for ", set, " matching ./", set, "_*.fasta, skipping.")
+    next
+  }
+  
+  ## ---- BayesANT training (once per set, reused for every ASV file) --------
+  # Training is set-level (depends only on the reference, not the query), so
+  # it's wasteful to redo it once per ASV file when a set has several -- do
+  # it once here and reuse the fitted classifier below.
+  message("=== ", set, ": training BayesANT classifier ===")
+  bayesant_ref <- file.path("bayesant_db", paste0(set, "_bayesant.fasta"))
+  
+  train_data <- read.BayesANT.data(
+    fasta.file = bayesant_ref,
+    rank = length(rank_names),
+    rank_names = rank_names
+  )
+  
+  # ASV references aren't a multiple-sequence alignment, so use BayesANT's
+  # k-mer ("not aligned") kernel rather than its aligned/site-based one.
+  classifier <- BayesANT(
+    data = train_data, typeseq = "not aligned",
+    kmers = 6, newtaxa = TRUE, verbose = TRUE
+  )
+  
+  tax_ref <- file.path("dada2_db", paste0(set, "_dada2_taxonomy.fasta"))
+  species_ref <- file.path("dada2_db", paste0(set, "_dada2_species.fasta"))
+  
+  for (asv_fasta in asv_matches) {
+    tag <- tools::file_path_sans_ext(basename(asv_fasta))   # e.g. Set0_ASVs, Set0_eDNA_ASVs
+    message("--- ", tag, " ---")
+    
+    asvs <- readDNAStringSet(asv_fasta)
+    asv_seqs <- as.character(asvs)
+    
+    ## ---- assignTaxonomy (DADA2) ---------------------------------------------
+    message("=== ", tag, ": assignTaxonomy ===")
+    taxa <- assignTaxonomy(asv_seqs, refFasta = tax_ref, multithread = n_threads, tryRC = TRUE)
+    
+    #if (file.exists(species_ref)) {
+    #  taxa <- addSpecies(taxa, species_ref, tryRC = TRUE)
+    #}
+    rownames(taxa) <- names(asvs)
+    write.csv(taxa, file.path("dada2_results", paste0(tag, "_assignTaxonomy.csv")))
+    
+    ## ---- BayesANT (predict only -- classifier already trained above) --------
+    message("=== ", tag, ": BayesANT ===")
+    query <- read.BayesANT.testDNA(asv_fasta)
+    result <- predict(
+      classifier, DNA = query, rho = 0.1,
+      return_probs = TRUE, n_top_taxa = 3, cores = n_threads
+    )
+    
+    write_rds(result, file.path("bayesant_results", paste0(tag, "_bayesant.RDS")))
+  }
+}
+
+message("Done. DADA2 results in ./dada2_results/, BayesANT results in ./bayesant_results/")
+
+suppressMessages(library(dplyr))
+
+lca_of <- function(df) {
+  result <- list()
+  agree <- TRUE
+  for (r in ranks) {
+    vals <- unique(df[[r]])
+    if (agree && length(vals) == 1 && !is.na(vals)) {
+      result[[r]] <- vals
+    } else {
+      agree <- FALSE
+      result[[r]] <- NA_character_
+    }
+  }
+  as_tibble(result)
+}
+# Normalize species to its last word in case dada2's Species is epithet-only.
+last_word <- function(x) sub(".*\\s", "", trimws(x))
+
+
+CS0_Bayesant<-read_rds("./bayesant_results/Set0_DB_derep_LOO_ASVs_bayesant.RDS")
+CS0_Dada2<-read_csv("./dada2_results/Set0_DB_derep_LOO_ASVs_assignTaxonomy.csv")
+CS0_Database<-read_tsv("../Set0_DB_derep_full_curation.txt",col_names = F)
+colnames(CS0_Database)<-
+  c("accession","listed_spec","taxid","superkingdom","phylum",
+    "class","order","family","genus","species","Sequence")
+C0_Blast<-read_tsv("./blast_results/Set0_DB_derep_LOO_ASVs_blast.tsv")
+colnames(C0_Blast)<-c(
+  "qseqid", "sseqid", "staxids", "pident", "length",
+  "mismatch", "gapopen", "qstart", "qend", "sstart", "send", "evalue", "bitscore", "qlen"
+)
+
+C0_Blast$accession<-C0_Blast$qseqid
+C0_Blast<-left_join(C0_Blast,CS0_Database,by="accession")
+
+blast_tbl <- C0_Blast %>%
+  #rename(ASV_ID = `...1`) %>%
+  rename_with(~ paste0("blast_", .))
+blast_tbl$ASV_ID<-blast_tbl$blast_accession
+
+ranks <- c("blast_order", "blast_family", "blast_genus", "blast_species")
+
+lca_hit <- blast_tbl %>%
+  group_by(ASV_ID) %>%
+  filter(blast_bitscore >= 0.9 * max(blast_bitscore)) %>%
+  group_modify(~ lca_of(.x)) %>%
+  ungroup() %>%
+  rename_with(~ paste0("lca_", sub("^blast_", "", .)), all_of(ranks))
+
+best_hit <- blast_tbl %>%
+  group_by(ASV_ID) %>%
+  slice_max(blast_bitscore, n = 1, with_ties = FALSE) %>%
+  ungroup() %>%
+  dplyr::select(ASV_ID, all_of(ranks)) %>%
+  rename_with(~ paste0("besthit_", sub("^blast_", "", .)), all_of(ranks))
+
+
+## ---- Combine ----------------------------------------------------------------
+asv_classification <- best_hit %>%
+  left_join(lca_hit, by = "ASV_ID")
+
+
+
+dada2_tbl <- CS0_Dada2 %>%
+  rename(ASV_ID = `...1`) %>%
+  rename_with(~ paste0("dada2_", .), -ASV_ID)
+dada2_tbl$dada2_Species<-gsub("_"," ",dada2_tbl$dada2_Species)
+bayesant_tbl <- CS0_Bayesant$prediction %>%
+  dplyr::select(Phylum, Class, Order, Family, Genus, Species) %>%
+  rename_with(~ paste0("bayesant_", .)) %>%
+  mutate(ASV_ID = dada2_tbl$ASV_ID)   # same row order as dada2_tbl
+
+truth_tbl <- CS0_Database %>%
+  dplyr::select(ASV_ID = accession, Phylum = phylum, Class = class, Order = order, Family = family,
+         Genus = genus, Species = species) %>%
+  rename_with(~ paste0("true_", .), -ASV_ID)
+colnames(bayesant_tbl)<-tolower(colnames(bayesant_tbl))
+colnames(dada2_tbl)<-tolower(colnames(dada2_tbl))
+colnames(truth_tbl)<-tolower(colnames(truth_tbl))
+colnames(best_hit)<-tolower(colnames(best_hit))
+colnames(lca_hit)<-tolower(colnames(lca_hit))
+
+CS0_comparison <- dada2_tbl %>%
+  left_join(bayesant_tbl, by = "asv_id") %>%
+  left_join(lca_hit, by = "asv_id") %>%
+  left_join(best_hit, by = "asv_id") %>%
+  left_join(truth_tbl, by = "asv_id")
+
+## ---- Score each method at each rank ---------------------------------------
+ranks <- c("order", "family", "genus", "species")
+
+
+for (r in ranks) {
+  true_col  <- CS0_comparison[[paste0("true_", r)]]
+  dada2_col <- CS0_comparison[[paste0("dada2_", r)]]
+  bayes_col <- CS0_comparison[[paste0("bayesant_", r)]]
+  lca_col <- CS0_comparison[[paste0("lca_", r)]]
+  best_col <- CS0_comparison[[paste0("besthit_", r)]]
+  
+  if (r == "species") {
+    true_col  <- last_word(true_col)
+    dada2_col <- last_word(dada2_col)
+    bayes_col <- last_word(bayes_col)
+    lca_col <- last_word(lca_col)
+    best_col <- last_word(best_col)
+  }
+  
+  CS0_comparison[[paste0("dada2_correct_", r)]]    <- !is.na(dada2_col) & dada2_col == true_col
+  CS0_comparison[[paste0("bayesant_correct_", r)]]  <- !is.na(bayes_col) & bayes_col == true_col
+  #CS0_comparison[[paste0("blast_correct_", r)]]  <- !is.na(blast_col) & blast_col == true_col
+  CS0_comparison[[paste0("besthit_correct_", r)]]  <- !is.na(best_col) & best_col == true_col
+  CS0_comparison[[paste0("lca_correct_", r)]]  <- !is.na(lca_col) & lca_col == true_col
+}
+
+# Deepest rank each method got right (0 = nothing right, 6 = species right).
+correct_depth <- function(df, prefix) {
+  flags <- as.matrix(df[paste0(prefix, "_correct_", ranks)])
+  apply(flags, 1, function(row) {
+    wrong <- which(!row)
+    if (length(wrong) == 0) length(row) else min(wrong) - 1
+  })
+}
+depth_cols <- c("dada2_depth", "bayesant_depth", "besthit_depth", "lca_depth")
+CS0_comparison$dada2_depth    <- correct_depth(CS0_comparison, "dada2")
+CS0_comparison$bayesant_depth <- correct_depth(CS0_comparison, "bayesant")
+CS0_comparison$lca_depth    <- correct_depth(CS0_comparison, "lca")
+CS0_comparison$besthit_depth <- correct_depth(CS0_comparison, "besthit")
+
+## ---- Sort: worst-overall calls first, biggest method disagreement next ----
+CS0_comparison <- CS0_comparison %>%
+  rowwise() %>%
+  mutate(
+    min_depth    = min(c_across(all_of(depth_cols))),
+    max_depth    = max(c_across(all_of(depth_cols))),
+    depth_spread = max_depth - min_depth
+  ) %>%
+  ungroup() %>%
+  arrange(min_depth, desc(depth_spread))
+
+## ---- The verdict: per-rank accuracy, all four methods side by side --------
+methods <- c("dada2", "bayesant", "besthit", "lca")
+
+accuracy_summary <- sapply(ranks, function(r) {
+  sapply(methods, function(m) mean(CS0_comparison[[paste0(m, "_correct_", r)]]))
+})
+print(round(accuracy_summary, 3))
+
+## ---- Single-number ranking: mean deepest-correct-rank per method ----------
+sort(colMeans(CS0_comparison[paste0(methods, "_depth")]), decreasing = TRUE)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+suppressMessages({
+  library(dplyr)
+  library(readr)
+  library(tibble)
+  library(tidyr)
+})
+
+last_word <- function(x) sub(".*\\s", "", trimws(x))
+
+lca_of <- function(df, rank_cols) {
+  result <- list()
+  agree <- TRUE
+  for (r in rank_cols) {
+    vals <- unique(na.omit(df[[r]]))
+    if (agree && length(vals) <= 1) {
+      result[[r]] <- if (length(vals) == 1) vals else NA_character_
+    } else {
+      agree <- FALSE
+      result[[r]] <- NA_character_
+    }
+  }
+  as_tibble(result)
+}
+
+correct_depth <- function(df, prefix, ranks) {
+  flags <- as.matrix(df[paste0(prefix, "_correct_", ranks)])
+  apply(flags, 1, function(row) {
+    wrong <- which(!row)
+    if (length(wrong) == 0) length(row) else min(wrong) - 1
+  })
+}
+
+run_set_comparison <- function(set) {
+  message("=== ", set, " ===")
+  
+  bayesant <- read_rds(file.path("bayesant_results", paste0(set, "_DB_derep_LOO_ASVs_bayesant.RDS")))
+  dada2    <- read_csv(file.path("dada2_results", paste0(set, "_DB_derep_LOO_ASVs_assignTaxonomy.csv")),
+                       show_col_types = FALSE)
+  database <- read_tsv(file.path("..", paste0(set, "_DB_derep_full_curation.txt")), col_names = FALSE,
+                       show_col_types = FALSE)
+  colnames(database) <- c("accession", "listed_spec", "taxid", "superkingdom", "phylum",
+                          "class", "order", "family", "genus", "species", "Sequence")
+  
+  blast <- read_tsv(file.path("blast_results", paste0(set, "_DB_derep_LOO_ASVs_blast.tsv")),
+                    show_col_types = FALSE)
+  colnames(blast) <- c("qseqid", "sseqid", "staxids", "pident", "length",
+                       "mismatch", "gapopen", "qstart", "qend", "sstart", "send",
+                       "evalue", "bitscore", "qlen")
+  blast$accession <- blast$qseqid
+  blast <- left_join(blast, database, by = "accession")
+  
+  blast_tbl <- blast %>% rename_with(~ paste0("blast_", .))
+  blast_tbl$ASV_ID <- blast_tbl$blast_accession
+  
+  blast_ranks <- c("blast_order", "blast_family", "blast_genus", "blast_species")
+  
+  lca_hit <- blast_tbl %>%
+    group_by(ASV_ID) %>%
+    filter(blast_bitscore >= 0.9 * max(blast_bitscore)) %>%
+    group_modify(~ lca_of(.x, blast_ranks)) %>%
+    ungroup() %>%
+    rename_with(~ paste0("lca_", sub("^blast_", "", .)), all_of(blast_ranks))
+  
+  best_hit <- blast_tbl %>%
+    group_by(ASV_ID) %>%
+    slice_max(blast_bitscore, n = 1, with_ties = FALSE) %>%
+    ungroup() %>%
+    dplyr::select(ASV_ID, all_of(blast_ranks)) %>%
+    rename_with(~ paste0("besthit_", sub("^blast_", "", .)), all_of(blast_ranks))
+  
+  dada2_tbl <- dada2 %>%
+    rename(ASV_ID = `...1`) %>%
+    rename_with(~ paste0("dada2_", .), -ASV_ID)
+  dada2_tbl$dada2_Species <- gsub("_", " ", dada2_tbl$dada2_Species)
+  
+  bayesant_tbl <- bayesant$prediction %>%
+    dplyr::select(Phylum, Class, Order, Family, Genus, Species) %>%
+    rename_with(~ paste0("bayesant_", .)) %>%
+    mutate(ASV_ID = dada2_tbl$ASV_ID)   # same row order as dada2_tbl
+  
+  truth_tbl <- database %>%
+    dplyr::select(ASV_ID = accession, Phylum = phylum, Class = class, Order = order,
+                  Family = family, Genus = genus, Species = species) %>%
+    rename_with(~ paste0("true_", .), -ASV_ID)
+  
+  colnames(bayesant_tbl) <- tolower(colnames(bayesant_tbl))
+  colnames(dada2_tbl)    <- tolower(colnames(dada2_tbl))
+  colnames(truth_tbl)    <- tolower(colnames(truth_tbl))
+  colnames(best_hit)     <- tolower(colnames(best_hit))
+  colnames(lca_hit)      <- tolower(colnames(lca_hit))
+  
+  comparison <- dada2_tbl %>%
+    left_join(bayesant_tbl, by = "asv_id") %>%
+    left_join(lca_hit, by = "asv_id") %>%
+    left_join(best_hit, by = "asv_id") %>%
+    left_join(truth_tbl, by = "asv_id")
+  
+  ranks   <- c("order", "family", "genus", "species")
+  methods <- c("dada2", "bayesant", "besthit", "lca")
+  
+  for (r in ranks) {
+    true_col  <- comparison[[paste0("true_", r)]]
+    dada2_col <- comparison[[paste0("dada2_", r)]]
+    bayes_col <- comparison[[paste0("bayesant_", r)]]
+    lca_col   <- comparison[[paste0("lca_", r)]]
+    best_col  <- comparison[[paste0("besthit_", r)]]
+    
+    if (r == "species") {
+      true_col  <- last_word(true_col)
+      dada2_col <- last_word(dada2_col)
+      bayes_col <- last_word(bayes_col)
+      lca_col   <- last_word(lca_col)
+      best_col  <- last_word(best_col)
+    }
+    
+    comparison[[paste0("dada2_correct_", r)]]    <- !is.na(dada2_col) & dada2_col == true_col
+    comparison[[paste0("bayesant_correct_", r)]] <- !is.na(bayes_col) & bayes_col == true_col
+    comparison[[paste0("besthit_correct_", r)]]  <- !is.na(best_col) & best_col == true_col
+    comparison[[paste0("lca_correct_", r)]]      <- !is.na(lca_col) & lca_col == true_col
+  }
+  
+  depth_cols <- paste0(methods, "_depth")
+  for (m in methods) {
+    comparison[[paste0(m, "_depth")]] <- correct_depth(comparison, m, ranks)
+  }
+  
+  comparison <- comparison %>%
+    rowwise() %>%
+    mutate(
+      min_depth    = min(c_across(all_of(depth_cols))),
+      max_depth    = max(c_across(all_of(depth_cols))),
+      depth_spread = max_depth - min_depth
+    ) %>%
+    ungroup() %>%
+    arrange(min_depth, desc(depth_spread))
+  
+  # accuracy_summary <- sapply(ranks, function(r) {
+  #   sapply(methods, function(m) mean(comparison[[paste0(m, "_correct_", r)]]))
+  # })
+  ## ---- Long-format correctness table, family kept as a grouping column -----
+  correct_long <- comparison %>%
+    dplyr::select(asv_id, true_family, matches(paste0("^(", paste(methods, collapse = "|"),
+                                                      ")_correct_(", paste(ranks, collapse = "|"), ")$"))) %>%
+    pivot_longer(
+      cols = -c(asv_id, true_family),
+      names_to = c("method", "rank"),
+      names_pattern = "(.*)_correct_(.*)",
+      values_to = "correct"
+    )
+  
+  overall_accuracy <- correct_long %>%
+    group_by(method, rank) %>%
+    summarise(accuracy = mean(correct), n = n(), .groups = "drop")
+  
+  family_accuracy <- correct_long %>%
+    group_by(true_family, method, rank) %>%
+    summarise(accuracy = mean(correct), n = n(), .groups = "drop")
+  
+  depth_rank <- sort(colMeans(comparison[depth_cols]), decreasing = TRUE)
+  
+  # list(comparison = comparison, accuracy = accuracy_summary, depth_rank = depth_rank)
+  list(comparison = comparison, accuracy = overall_accuracy,
+       family_accuracy = family_accuracy, depth_rank = depth_rank)
+  
+}
+
+## ---- Run for all four sets --------------------------------------------------
+sets <- c("Set0", "Set1", "Set2", "Set3")
+all_results <- setNames(lapply(sets, run_set_comparison), sets)
+
+# e.g. individual set's comparison table: all_results$Set0$comparison
+
+## ---- Per-set accuracy summaries ---------------------------------------------
+for (set in sets) {
+  message("--- ", set, " ---")
+  print(round(all_results[[set]]$accuracy, 3))
+}
+
+## ---- Combined accuracy across all sets, mean per method/rank ----------------
+accuracy_long <- bind_rows(lapply(sets, function(set) {
+  as_tibble(all_results[[set]]$accuracy, rownames = "method") %>%
+    pivot_longer(-method, names_to = "rank", values_to = "accuracy") %>%
+    mutate(set = set)
+}))
+
+accuracy_long %>%
+  group_by(method, rank,set) %>%
+  summarise(mean_accuracy = mean(accuracy), .groups = "drop") %>%
+  arrange(rank, desc(mean_accuracy))
+
+## ---- Combined accuracy across all sets, mean per method/rank -------------
+accuracy_long <- bind_rows(lapply(sets, function(set) {
+  all_results[[set]]$accuracy %>% mutate(set = set)
+}))
+
+accuracy_long %>%
+  group_by(method, rank, set) %>%
+  summarise(mean_accuracy = mean(accuracy), .groups = "drop") %>%
+  arrange(rank, desc(mean_accuracy))
+
+## ---- Combined accuracy across all sets, mean per method/rank/family ------
+family_accuracy_long <- bind_rows(lapply(sets, function(set) {
+  all_results[[set]]$family_accuracy %>% mutate(set = set)
+}))
+
+family_accuracy_long %>%
+  group_by(method, rank, true_family) %>%
+  summarise(mean_accuracy = mean(accuracy), n = sum(n), .groups = "drop") %>%
+  arrange(rank, true_family, desc(mean_accuracy))
